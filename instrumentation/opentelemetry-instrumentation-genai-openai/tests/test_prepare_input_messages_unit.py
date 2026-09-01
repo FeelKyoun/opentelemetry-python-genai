@@ -88,6 +88,29 @@ def test_none_content_produces_no_parts():
     assert result[0].parts == []
 
 
+def test_single_pass_iterable_content_is_not_partially_dropped():
+    def content_parts():
+        yield {"type": "text", "text": "hello"}
+        yield {"type": "image_url", "image_url": {"url": "https://e/x.png"}}
+
+    messages = [{"role": "user", "content": content_parts()}]
+
+    result = _prepare_input_messages(messages)
+
+    parts = result[0].parts
+    assert [type(part) for part in parts] == [TextPart, GenericPart]
+    assert parts[0] == TextPart(content="hello")
+
+
+def test_mapping_content_is_not_treated_as_content_part_array():
+    content = {"unexpected": "shape"}
+    messages = [{"role": "user", "content": content}]
+
+    result = _prepare_input_messages(messages)
+
+    assert result[0].parts == [TextPart(content=str(content))]
+
+
 def test_multimodal_message_is_json_serializable():
     messages = [
         {

@@ -227,6 +227,33 @@ def _extract_content_parts(content: Iterable[Any]) -> list[Any]:
     return parts
 
 
+def _content_to_parts(content: Any) -> list[Any]:
+    """Map message ``content`` to message parts.
+
+    Strings map to a single ``TextPart``. Mappings keep the previous
+    ``_is_text_part`` behavior (string-keyed mappings are captured as
+    ``str(mapping)``) and are never treated as content-part arrays. Other
+    iterables are materialized exactly once — ``content`` may be a
+    single-pass iterable, and type-checking then re-iterating would silently
+    drop the items already consumed — then map to a ``TextPart`` when
+    string-only, or through ``_extract_content_parts`` otherwise.
+    """
+    if isinstance(content, str):
+        return [TextPart(content=content)]
+    if content is None:
+        return []
+    if isinstance(content, Mapping):
+        if all(isinstance(key, str) for key in content):
+            return [TextPart(content=str(content))]
+        return []
+    if isinstance(content, Iterable):
+        items = list(content)
+        if all(isinstance(item, str) for item in items):
+            return [TextPart(content=str(items))]
+        return _extract_content_parts(items)
+    return []
+
+
 def _prepare_input_messages(messages) -> list[InputMessage]:
     chat_messages = []
     for message in messages:
@@ -240,10 +267,7 @@ def _prepare_input_messages(messages) -> list[InputMessage]:
             tool_calls = get_property_value(message, "tool_calls")
             if tool_calls:
                 chat_message.parts += extract_tool_calls_new(tool_calls)
-            if _is_text_part(content):
-                chat_message.parts.append(TextPart(content=str(content)))
-            elif content is not None and isinstance(content, Iterable):
-                chat_message.parts += _extract_content_parts(content)
+            chat_message.parts += _content_to_parts(content)
 
         elif role == "tool":
             tool_call_id = get_property_value(message, "tool_call_id")
@@ -253,10 +277,7 @@ def _prepare_input_messages(messages) -> list[InputMessage]:
 
         else:
             # system, developer, user, fallback
-            if _is_text_part(content):
-                chat_message.parts.append(TextPart(content=str(content)))
-            elif content is not None and isinstance(content, Iterable):
-                chat_message.parts += _extract_content_parts(content)
+            chat_message.parts += _content_to_parts(content)
     return chat_messages
 
 
