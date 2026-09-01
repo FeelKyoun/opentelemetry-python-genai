@@ -23,6 +23,7 @@ from opentelemetry.util.genai.invocation import (
 )
 from opentelemetry.util.genai.types import (
     FunctionToolDefinition,
+    GenericPart,
     InputMessage,
     OutputMessage,
     TextPart,
@@ -191,6 +192,41 @@ def _is_text_part(content: Any) -> bool:
     )
 
 
+def _as_plain_value(item: Any) -> Any:
+    """Return a JSON-serializable representation of a content part."""
+    if isinstance(item, Mapping):
+        return dict(item)
+    model_dump = getattr(item, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    return str(item)
+
+
+def _extract_content_parts(content: Iterable[Any]) -> list[Any]:
+    """Map an OpenAI content-part array (multimodal content) to message parts.
+
+    ``text`` parts map to ``TextPart``. Any other part type (``image_url``,
+    ``input_audio``, ...) is preserved as a ``GenericPart`` carrying the
+    provider-specific type discriminator and payload, so opted-in content
+    capture does not silently drop the message.
+    """
+    parts: list[Any] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(TextPart(content=item))
+            continue
+        item_type = get_property_value(item, "type")
+        if item_type == "text":
+            parts.append(
+                TextPart(content=str(get_property_value(item, "text") or ""))
+            )
+        else:
+            parts.append(
+                GenericPart(type=str(item_type), value=_as_plain_value(item))
+            )
+    return parts
+
+
 def _prepare_input_messages(messages) -> list[InputMessage]:
     chat_messages = []
     for message in messages:
@@ -206,6 +242,8 @@ def _prepare_input_messages(messages) -> list[InputMessage]:
                 chat_message.parts += extract_tool_calls_new(tool_calls)
             if _is_text_part(content):
                 chat_message.parts.append(TextPart(content=str(content)))
+            elif content is not None and isinstance(content, Iterable):
+                chat_message.parts += _extract_content_parts(content)
 
         elif role == "tool":
             tool_call_id = get_property_value(message, "tool_call_id")
@@ -217,6 +255,8 @@ def _prepare_input_messages(messages) -> list[InputMessage]:
             # system, developer, user, fallback
             if _is_text_part(content):
                 chat_message.parts.append(TextPart(content=str(content)))
+            elif content is not None and isinstance(content, Iterable):
+                chat_message.parts += _extract_content_parts(content)
     return chat_messages
 
 
