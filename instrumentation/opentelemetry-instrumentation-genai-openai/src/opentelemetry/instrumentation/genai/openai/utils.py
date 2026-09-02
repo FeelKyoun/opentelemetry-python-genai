@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -22,15 +22,19 @@ from opentelemetry.util.genai.invocation import (
     InferenceInvocation,
 )
 from opentelemetry.util.genai.types import (
+    BlobPart,
+    FilePart,
     FunctionToolDefinition,
     GenericPart,
     InputMessage,
+    MessagePart,
     OutputMessage,
     TextPart,
     ToolCallRequestPart,
     ToolCallResponsePart,
     ToolDefinition,
 )
+from opentelemetry.util.genai.utils import decode_base64, image_from_url
 
 _OpenAIOmit = getattr(openai, "Omit", None)
 
@@ -192,6 +196,12 @@ def _is_text_part(content: Any) -> bool:
     )
 
 
+_AUDIO_MIME_TYPES: Mapping[str, str] = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+}
+
+
 def _as_plain_value(item: Any) -> Any:
     """Return a JSON-serializable representation of a content part."""
     if isinstance(item, Mapping):
@@ -202,56 +212,101 @@ def _as_plain_value(item: Any) -> Any:
     return str(item)
 
 
-def _extract_content_parts(content: Iterable[Any]) -> list[Any]:
-    """Map an OpenAI content-part array (multimodal content) to message parts.
+def _image_url_part(item: Any) -> MessagePart | None:
+    """Map an ``image_url`` content part to a ``UriPart`` or ``BlobPart``."""
+    image_url = get_property_value(item, "image_url")
+    url = (
+        image_url
+        if isinstance(image_url, str)
+        else get_property_value(image_url, "url")
+    )
+    if not isinstance(url, str) or not url:
+        return None
+    return image_from_url(url)
 
-    ``text`` parts map to ``TextPart``. Any other part type (``image_url``,
-    ``input_audio``, ...) is preserved as a ``GenericPart`` carrying the
-    provider-specific type discriminator and payload, so opted-in content
-    capture does not silently drop the message.
+
+def _input_audio_part(item: Any) -> MessagePart | None:
+    """Map an ``input_audio`` content part to an audio ``BlobPart``."""
+    input_audio = get_property_value(item, "input_audio")
+    data = get_property_value(input_audio, "data")
+    if not isinstance(data, str):
+        return None
+    content = decode_base64(data)
+    if content is None:
+        return None
+    audio_format = get_property_value(input_audio, "format")
+    mime_type = None
+    if isinstance(audio_format, str) and audio_format:
+        audio_format = audio_format.lower()
+        mime_type = _AUDIO_MIME_TYPES.get(
+            audio_format, f"audio/{audio_format}"
+        )
+    return BlobPart(mime_type=mime_type, modality="audio", content=content)
+
+
+def _file_part(item: Any) -> MessagePart | None:
+    """Map a ``file`` content part to a ``FilePart`` (``file_id``) or a
+    ``BlobPart`` (inline ``file_data`` data URL)."""
+    file_ref = get_property_value(item, "file")
+    file_id = get_property_value(file_ref, "file_id")
+    if isinstance(file_id, str) and file_id:
+        return FilePart(mime_type=None, modality="document", file_id=file_id)
+    file_data = get_property_value(file_ref, "file_data")
+    if isinstance(file_data, str) and file_data:
+        return image_from_url(file_data, modality="document")
+    return None
+
+
+_CONTENT_PART_CONVERTERS: Mapping[str, Callable[[Any], MessagePart | None]] = {
+    "image_url": _image_url_part,
+    "input_audio": _input_audio_part,
+    "file": _file_part,
+}
+
+
+def _convert_content_part(item: Any) -> MessagePart | None:
+    """Map one OpenAI content part to a semconv message part.
+
+    ``text`` parts map to ``TextPart``; ``image_url``, ``input_audio`` and
+    ``file`` parts map to the standard media parts (``UriPart``,
+    ``BlobPart``, ``FilePart``). Any other typed part is preserved as a
+    ``GenericPart`` so opted-in content capture does not silently drop it.
+    Returns ``None`` for items without a type discriminator and for media
+    parts whose payload cannot be decoded.
     """
-    parts: list[Any] = []
-    for item in content:
-        if isinstance(item, str):
-            parts.append(TextPart(content=item))
-            continue
-        item_type = get_property_value(item, "type")
-        if item_type == "text":
-            parts.append(
-                TextPart(content=str(get_property_value(item, "text") or ""))
-            )
-        else:
-            parts.append(
-                GenericPart(type=str(item_type), value=_as_plain_value(item))
-            )
-    return parts
+    if isinstance(item, str):
+        return TextPart(content=item)
+    item_type = get_property_value(item, "type")
+    if not isinstance(item_type, str):
+        return None
+    if item_type == "text":
+        text = get_property_value(item, "text")
+        return TextPart(content=str(text) if text is not None else "")
+    converter = _CONTENT_PART_CONVERTERS.get(item_type)
+    if converter is not None:
+        return converter(item)
+    return GenericPart(type=item_type, value=_as_plain_value(item))
 
 
-def _content_to_parts(content: Any) -> list[Any]:
+def _content_to_parts(content: Any) -> list[MessagePart]:
     """Map message ``content`` to message parts.
 
-    Strings map to a single ``TextPart``. Mappings keep the previous
-    ``_is_text_part`` behavior (string-keyed mappings are captured as
-    ``str(mapping)``) and are never treated as content-part arrays. Other
-    iterables are materialized exactly once — ``content`` may be a
-    single-pass iterable, and type-checking then re-iterating would silently
-    drop the items already consumed — then map to a ``TextPart`` when
-    string-only, or through ``_extract_content_parts`` otherwise.
+    A string is a single text part and a bare mapping is a single content
+    part. Any other iterable is an OpenAI content-part array; it is consumed
+    exactly once, so single-pass iterables are never partially dropped.
     """
-    if isinstance(content, str):
-        return [TextPart(content=content)]
     if content is None:
         return []
-    if isinstance(content, Mapping):
-        if all(isinstance(key, str) for key in content):
-            return [TextPart(content=str(content))]
+    if isinstance(content, (str, Mapping)):
+        content = [content]
+    if not isinstance(content, Iterable):
         return []
-    if isinstance(content, Iterable):
-        items = list(content)
-        if all(isinstance(item, str) for item in items):
-            return [TextPart(content=str(items))]
-        return _extract_content_parts(items)
-    return []
+    parts: list[MessagePart] = []
+    for item in content:
+        part = _convert_content_part(item)
+        if part is not None:
+            parts.append(part)
+    return parts
 
 
 def _prepare_input_messages(messages) -> list[InputMessage]:

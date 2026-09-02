@@ -1,3 +1,4 @@
-Preserve multimodal content-part arrays in captured input messages: ``text``
-parts map to ``TextPart`` and other part types (``image_url``,
-``input_audio``, ...) are kept as ``GenericPart`` instead of being dropped.
+Capture multimodal content-part arrays on input messages instead of dropping
+them: ``image_url`` parts map to ``UriPart``/``BlobPart``, ``input_audio`` to
+an audio ``BlobPart``, ``file`` to ``FilePart``/``BlobPart``, and any other
+typed part is preserved as a ``GenericPart``.
