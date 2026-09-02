@@ -5,6 +5,8 @@
 
 import base64
 from dataclasses import asdict
+from datetime import datetime, timezone
+from types import MappingProxyType
 
 from opentelemetry.instrumentation.genai.openai.utils import (
     _prepare_input_messages,
@@ -25,6 +27,7 @@ PNG_BASE64 = (
     "60e6kgAAAABJRU5ErkJggg=="
 )
 PNG_DATA_URL = f"data:image/png;base64,{PNG_BASE64}"
+PDF_BASE64 = "JVBERi0="  # b"%PDF-"
 
 
 def _user_parts(content):
@@ -82,22 +85,66 @@ def test_input_audio_maps_to_audio_blob_part():
     ]
 
 
-def test_file_id_maps_to_file_part():
-    parts = _user_parts([{"type": "file", "file": {"file_id": "file-abc"}}])
+def test_input_audio_data_url_maps_to_audio_blob_part():
+    parts = _user_parts(
+        [
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "data:audio/wav;base64,UklGRg==",
+                    "format": "wav",
+                },
+            }
+        ]
+    )
 
     assert parts == [
-        FilePart(mime_type=None, modality="document", file_id="file-abc")
+        BlobPart(mime_type="audio/wav", modality="audio", content=b"RIFF")
     ]
 
 
-def test_file_data_maps_to_document_blob_part():
+def test_unknown_audio_format_has_no_mime_type():
+    parts = _user_parts(
+        [
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "UklGRg==", "format": "pcm16"},
+            }
+        ]
+    )
+
+    assert parts == [
+        BlobPart(mime_type=None, modality="audio", content=b"RIFF")
+    ]
+
+
+def test_file_id_maps_to_file_part():
+    parts = _user_parts(
+        [
+            {
+                "type": "file",
+                "file": {"file_id": "file-abc", "filename": "a.pdf"},
+            }
+        ]
+    )
+
+    assert parts == [
+        FilePart(
+            mime_type="application/pdf",
+            modality="document",
+            file_id="file-abc",
+        )
+    ]
+
+
+def test_file_data_url_maps_to_document_blob_part():
     parts = _user_parts(
         [
             {
                 "type": "file",
                 "file": {
                     "filename": "doc.pdf",
-                    "file_data": "data:application/pdf;base64,JVBERi0=",
+                    "file_data": f"data:application/pdf;base64,{PDF_BASE64}",
                 },
             }
         ]
@@ -110,6 +157,31 @@ def test_file_data_maps_to_document_blob_part():
     ]
 
 
+def test_plain_base64_file_data_maps_to_document_blob_part():
+    parts = _user_parts(
+        [
+            {
+                "type": "file",
+                "file": {"filename": "doc.pdf", "file_data": PDF_BASE64},
+            }
+        ]
+    )
+
+    assert parts == [
+        BlobPart(
+            mime_type="application/pdf", modality="document", content=b"%PDF-"
+        )
+    ]
+
+
+def test_undecodable_file_data_is_dropped():
+    parts = _user_parts(
+        [{"type": "file", "file": {"file_data": "not base64!!"}}]
+    )
+
+    assert parts == []
+
+
 def test_unknown_part_type_is_preserved_as_generic_part():
     item = {"type": "custom_widget", "custom_widget": {"id": 7}}
 
@@ -118,8 +190,58 @@ def test_unknown_part_type_is_preserved_as_generic_part():
     ]
 
 
+def test_generic_part_value_is_json_safe():
+    item = {
+        "type": "custom",
+        "when": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "tags": {"a"},
+        "nested": {"n": (1, 2)},
+    }
+
+    parts = _user_parts([item])
+
+    assert parts == [
+        GenericPart(
+            type="custom",
+            value={
+                "type": "custom",
+                "when": "2026-01-01 00:00:00+00:00",
+                "tags": "{'a'}",
+                "nested": {"n": [1, 2]},
+            },
+        )
+    ]
+    gen_ai_json_dumps(asdict(parts[0]))
+
+
+def test_generic_part_value_does_not_alias_input():
+    item = {"type": "custom", "nested": {"n": 1}}
+
+    parts = _user_parts([item])
+    item["nested"]["n"] = 2
+
+    assert parts[0].value == {"type": "custom", "nested": {"n": 1}}
+
+
 def test_untyped_part_is_dropped():
     assert _user_parts([{"unexpected": "shape"}]) == []
+
+
+def test_non_string_text_part_is_dropped():
+    assert _user_parts([{"type": "text", "text": {"a": 1}}]) == []
+
+
+def test_raising_part_is_skipped_without_breaking_the_message():
+    class ExplodingPart:
+        @property
+        def type(self):
+            raise RuntimeError("boom")
+
+    parts = _user_parts(
+        [ExplodingPart(), {"type": "text", "text": "still captured"}]
+    )
+
+    assert parts == [TextPart(content="still captured")]
 
 
 def test_multimodal_assistant_history_content():
@@ -150,21 +272,36 @@ def test_string_list_content_maps_each_item_to_text_part():
     ]
 
 
+def test_tuple_content_is_treated_as_content_part_array():
+    assert _user_parts(({"type": "text", "text": "hello"},)) == [
+        TextPart(content="hello")
+    ]
+
+
 def test_mapping_content_is_treated_as_single_part():
     parts = _user_parts({"type": "text", "text": "hello"})
 
     assert parts == [TextPart(content="hello")]
 
 
-def test_single_pass_iterable_content_is_consumed_once():
+def test_non_dict_mapping_content_is_treated_as_single_part():
+    content = MappingProxyType({"type": "text", "text": "hello"})
+
+    assert _user_parts(content) == [TextPart(content="hello")]
+
+
+def test_generator_content_is_left_unconsumed_and_not_captured():
+    # The OpenAI SDK accepts any iterable of content parts and materializes
+    # it itself; capturing it here would drain the caller's input before the
+    # request is sent.
     def content_parts():
         yield {"type": "text", "text": "hello"}
         yield {"type": "image_url", "image_url": {"url": IMAGE_URL}}
 
-    assert _user_parts(content_parts()) == [
-        TextPart(content="hello"),
-        UriPart(mime_type=None, modality="image", uri=IMAGE_URL),
-    ]
+    content = content_parts()
+
+    assert _user_parts(content) == []
+    assert len(list(content)) == 2
 
 
 def test_multimodal_message_is_json_serializable():

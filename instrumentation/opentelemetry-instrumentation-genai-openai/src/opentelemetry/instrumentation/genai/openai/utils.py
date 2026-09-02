@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable, Mapping
+import logging
+import mimetypes
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
@@ -36,6 +38,8 @@ from opentelemetry.util.genai.types import (
 )
 from opentelemetry.util.genai.utils import decode_base64, image_from_url
 
+_logger = logging.getLogger(__name__)
+
 _OpenAIOmit = getattr(openai, "Omit", None)
 
 SUPPORTED_RAPI_RESPONSE_HEADERS = ("x-ms-served-model",)
@@ -59,7 +63,7 @@ def get_served_model(headers: Mapping[str, str] | None) -> str | None:
 
 
 def get_property_value(obj, property_name):
-    if isinstance(obj, dict):
+    if isinstance(obj, Mapping):
         return obj.get(property_name, None)
 
     return getattr(obj, property_name, None)
@@ -203,13 +207,26 @@ _AUDIO_MIME_TYPES: Mapping[str, str] = {
 
 
 def _as_plain_value(item: Any) -> Any:
-    """Return a JSON-serializable representation of a content part."""
-    if isinstance(item, Mapping):
-        return dict(item)
-    model_dump = getattr(item, "model_dump", None)
-    if callable(model_dump):
-        return model_dump()
-    return str(item)
+    """Return a JSON-safe representation of a content part.
+
+    Never raises: pydantic models are dumped in JSON mode, the result is
+    round-tripped through ``json`` so only JSON-native values remain, and any
+    failure falls back to ``str(item)``.
+    """
+    try:
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            try:
+                value = model_dump(mode="json")
+            except Exception:  # pylint: disable=broad-exception-caught
+                value = model_dump()  # pydantic v1 has no ``mode``
+        elif isinstance(item, Mapping):
+            value = dict(item)
+        else:
+            value = item
+        return json.loads(json.dumps(value, default=str))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return str(item)
 
 
 def _image_url_part(item: Any) -> MessagePart | None:
@@ -229,51 +246,47 @@ def _input_audio_part(item: Any) -> MessagePart | None:
     """Map an ``input_audio`` content part to an audio ``BlobPart``."""
     input_audio = get_property_value(item, "input_audio")
     data = get_property_value(input_audio, "data")
-    if not isinstance(data, str):
+    if not isinstance(data, str) or not data:
         return None
+    if data.startswith("data:"):
+        return image_from_url(data, modality="audio")
     content = decode_base64(data)
     if content is None:
         return None
     audio_format = get_property_value(input_audio, "format")
     mime_type = None
-    if isinstance(audio_format, str) and audio_format:
-        audio_format = audio_format.lower()
-        mime_type = _AUDIO_MIME_TYPES.get(
-            audio_format, f"audio/{audio_format}"
-        )
+    if isinstance(audio_format, str):
+        mime_type = _AUDIO_MIME_TYPES.get(audio_format.lower())
     return BlobPart(mime_type=mime_type, modality="audio", content=content)
 
 
 def _file_part(item: Any) -> MessagePart | None:
     """Map a ``file`` content part to a ``FilePart`` (``file_id``) or a
-    ``BlobPart`` (inline ``file_data`` data URL)."""
+    document ``BlobPart`` (inline ``file_data``, base64 or data URL)."""
     file_ref = get_property_value(item, "file")
+    filename = get_property_value(file_ref, "filename")
+    mime_type = None
+    if isinstance(filename, str) and filename:
+        mime_type = mimetypes.guess_type(filename)[0]
     file_id = get_property_value(file_ref, "file_id")
     if isinstance(file_id, str) and file_id:
-        return FilePart(mime_type=None, modality="document", file_id=file_id)
+        return FilePart(
+            mime_type=mime_type, modality="document", file_id=file_id
+        )
     file_data = get_property_value(file_ref, "file_data")
-    if isinstance(file_data, str) and file_data:
+    if not isinstance(file_data, str) or not file_data:
+        return None
+    if file_data.startswith("data:"):
         return image_from_url(file_data, modality="document")
-    return None
-
-
-_CONTENT_PART_CONVERTERS: Mapping[str, Callable[[Any], MessagePart | None]] = {
-    "image_url": _image_url_part,
-    "input_audio": _input_audio_part,
-    "file": _file_part,
-}
+    content = decode_base64(file_data)
+    if content is None:
+        return None
+    return BlobPart(mime_type=mime_type, modality="document", content=content)
 
 
 def _convert_content_part(item: Any) -> MessagePart | None:
-    """Map one OpenAI content part to a semconv message part.
-
-    ``text`` parts map to ``TextPart``; ``image_url``, ``input_audio`` and
-    ``file`` parts map to the standard media parts (``UriPart``,
-    ``BlobPart``, ``FilePart``). Any other typed part is preserved as a
-    ``GenericPart`` so opted-in content capture does not silently drop it.
-    Returns ``None`` for items without a type discriminator and for media
-    parts whose payload cannot be decoded.
-    """
+    """Map one OpenAI content part to a semconv message part; typed parts
+    with no semconv mapping become ``GenericPart`` rather than being dropped."""
     if isinstance(item, str):
         return TextPart(content=item)
     item_type = get_property_value(item, "type")
@@ -281,10 +294,13 @@ def _convert_content_part(item: Any) -> MessagePart | None:
         return None
     if item_type == "text":
         text = get_property_value(item, "text")
-        return TextPart(content=str(text) if text is not None else "")
-    converter = _CONTENT_PART_CONVERTERS.get(item_type)
-    if converter is not None:
-        return converter(item)
+        return TextPart(content=text) if isinstance(text, str) else None
+    if item_type == "image_url":
+        return _image_url_part(item)
+    if item_type == "input_audio":
+        return _input_audio_part(item)
+    if item_type == "file":
+        return _file_part(item)
     return GenericPart(type=item_type, value=_as_plain_value(item))
 
 
@@ -292,18 +308,22 @@ def _content_to_parts(content: Any) -> list[MessagePart]:
     """Map message ``content`` to message parts.
 
     A string is a single text part and a bare mapping is a single content
-    part. Any other iterable is an OpenAI content-part array; it is consumed
-    exactly once, so single-pass iterables are never partially dropped.
+    part. Only sequences are walked as content-part arrays: iterating any
+    other iterable (e.g. a generator) would consume the caller's input before
+    the SDK sends it, so those are left untouched and not captured.
+    Conversion never raises; a part that fails to convert is skipped.
     """
-    if content is None:
-        return []
     if isinstance(content, (str, Mapping)):
         content = [content]
-    if not isinstance(content, Iterable):
+    if not isinstance(content, Sequence):
         return []
     parts: list[MessagePart] = []
     for item in content:
-        part = _convert_content_part(item)
+        try:
+            part = _convert_content_part(item)
+        except Exception:  # pylint: disable=broad-exception-caught
+            _logger.debug("Failed to convert content part", exc_info=True)
+            continue
         if part is not None:
             parts.append(part)
     return parts
