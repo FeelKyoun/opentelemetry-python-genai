@@ -105,49 +105,20 @@ def test_file_id_maps_to_file_part():
     ]
 
 
-def test_file_data_url_maps_to_document_blob_part():
+def test_inline_file_data_is_not_captured():
+    # Inline documents can be megabytes per part; they are deliberately left
+    # out of telemetry while the surrounding parts are still captured.
     parts = _user_parts(
         [
-            {
-                "type": "file",
-                "file": {
-                    "filename": "doc.pdf",
-                    "file_data": f"data:application/pdf;base64,{PDF_BASE64}",
-                },
-            }
-        ]
-    )
-
-    assert parts == [
-        BlobPart(
-            mime_type="application/pdf", modality="document", content=b"%PDF-"
-        )
-    ]
-
-
-def test_plain_base64_file_data_maps_to_document_blob_part():
-    parts = _user_parts(
-        [
+            {"type": "text", "text": "summarize this"},
             {
                 "type": "file",
                 "file": {"filename": "doc.pdf", "file_data": PDF_BASE64},
-            }
+            },
         ]
     )
 
-    assert parts == [
-        BlobPart(
-            mime_type="application/pdf", modality="document", content=b"%PDF-"
-        )
-    ]
-
-
-def test_undecodable_file_data_is_dropped():
-    parts = _user_parts(
-        [{"type": "file", "file": {"file_data": "not base64!!"}}]
-    )
-
-    assert parts == []
+    assert parts == [TextPart(content="summarize this")]
 
 
 def test_unknown_part_type_is_preserved_as_generic_part():

@@ -24,7 +24,6 @@ from opentelemetry.util.genai.invocation import (
     InferenceInvocation,
 )
 from opentelemetry.util.genai.types import (
-    BlobPart,
     FilePart,
     FunctionToolDefinition,
     GenericPart,
@@ -36,7 +35,7 @@ from opentelemetry.util.genai.types import (
     ToolCallResponsePart,
     ToolDefinition,
 )
-from opentelemetry.util.genai.utils import decode_base64, image_from_url
+from opentelemetry.util.genai.utils import image_from_url
 
 _logger = logging.getLogger(__name__)
 
@@ -237,33 +236,27 @@ def _image_url_part(item: Any) -> MessagePart | None:
 
 
 def _file_part(item: Any) -> MessagePart | None:
-    """Map a ``file`` content part to a ``FilePart`` (``file_id``) or a
-    document ``BlobPart`` (inline ``file_data``, base64 or data URL)."""
+    """Map a ``file`` content part with a ``file_id`` to a ``FilePart``.
+
+    Inline ``file_data`` is intentionally not captured: a single document can
+    be megabytes, and it would be base64-inlined into the span attribute.
+    """
     file_ref = get_property_value(item, "file")
+    file_id = get_property_value(file_ref, "file_id")
+    if not isinstance(file_id, str) or not file_id:
+        return None
     filename = get_property_value(file_ref, "filename")
     mime_type = None
     if isinstance(filename, str) and filename:
         mime_type = mimetypes.guess_type(filename)[0]
-    file_id = get_property_value(file_ref, "file_id")
-    if isinstance(file_id, str) and file_id:
-        return FilePart(
-            mime_type=mime_type, modality="document", file_id=file_id
-        )
-    file_data = get_property_value(file_ref, "file_data")
-    if not isinstance(file_data, str) or not file_data:
-        return None
-    if file_data.startswith("data:"):
-        return image_from_url(file_data, modality="document")
-    content = decode_base64(file_data)
-    if content is None:
-        return None
-    return BlobPart(mime_type=mime_type, modality="document", content=content)
+    return FilePart(mime_type=mime_type, modality="document", file_id=file_id)
 
 
 def _convert_content_part(item: Any) -> MessagePart | None:
     """Map one OpenAI content part to a semconv message part; typed parts
     with no semconv mapping become ``GenericPart`` rather than being dropped.
-    ``input_audio`` parts are the exception and are never captured."""
+    Inline media payloads (``input_audio``, ``file_data``) are the exception
+    and are never captured."""
     if isinstance(item, str):
         return TextPart(content=item)
     item_type = get_property_value(item, "type")
