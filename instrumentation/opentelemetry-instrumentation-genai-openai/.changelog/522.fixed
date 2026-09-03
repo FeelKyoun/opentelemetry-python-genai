@@ -1,4 +1,5 @@
 Capture multimodal content-part arrays on input messages instead of dropping
-them: ``image_url`` parts map to ``UriPart``/``BlobPart``, ``input_audio`` to
-an audio ``BlobPart``, ``file`` to ``FilePart``/``BlobPart``, and any other
-typed part is preserved as a ``GenericPart``.
+them: ``image_url`` parts map to ``UriPart``/``BlobPart``, ``file`` to
+``FilePart``/``BlobPart``, and any other typed part is preserved as a
+``GenericPart``. Inline ``input_audio`` payloads are intentionally not
+captured.

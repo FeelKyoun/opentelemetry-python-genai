@@ -200,12 +200,6 @@ def _is_text_part(content: Any) -> bool:
     )
 
 
-_AUDIO_MIME_TYPES: Mapping[str, str] = {
-    "mp3": "audio/mpeg",
-    "wav": "audio/wav",
-}
-
-
 def _as_plain_value(item: Any) -> Any:
     """Return a JSON-safe representation of a content part.
 
@@ -242,24 +236,6 @@ def _image_url_part(item: Any) -> MessagePart | None:
     return image_from_url(url)
 
 
-def _input_audio_part(item: Any) -> MessagePart | None:
-    """Map an ``input_audio`` content part to an audio ``BlobPart``."""
-    input_audio = get_property_value(item, "input_audio")
-    data = get_property_value(input_audio, "data")
-    if not isinstance(data, str) or not data:
-        return None
-    if data.startswith("data:"):
-        return image_from_url(data, modality="audio")
-    content = decode_base64(data)
-    if content is None:
-        return None
-    audio_format = get_property_value(input_audio, "format")
-    mime_type = None
-    if isinstance(audio_format, str):
-        mime_type = _AUDIO_MIME_TYPES.get(audio_format.lower())
-    return BlobPart(mime_type=mime_type, modality="audio", content=content)
-
-
 def _file_part(item: Any) -> MessagePart | None:
     """Map a ``file`` content part to a ``FilePart`` (``file_id``) or a
     document ``BlobPart`` (inline ``file_data``, base64 or data URL)."""
@@ -286,7 +262,8 @@ def _file_part(item: Any) -> MessagePart | None:
 
 def _convert_content_part(item: Any) -> MessagePart | None:
     """Map one OpenAI content part to a semconv message part; typed parts
-    with no semconv mapping become ``GenericPart`` rather than being dropped."""
+    with no semconv mapping become ``GenericPart`` rather than being dropped.
+    ``input_audio`` parts are the exception and are never captured."""
     if isinstance(item, str):
         return TextPart(content=item)
     item_type = get_property_value(item, "type")
@@ -298,7 +275,9 @@ def _convert_content_part(item: Any) -> MessagePart | None:
     if item_type == "image_url":
         return _image_url_part(item)
     if item_type == "input_audio":
-        return _input_audio_part(item)
+        # Inline audio is intentionally not captured: a single clip can be
+        # megabytes, and it would be base64-inlined into the span attribute.
+        return None
     if item_type == "file":
         return _file_part(item)
     return GenericPart(type=item_type, value=_as_plain_value(item))

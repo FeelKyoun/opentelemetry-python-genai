@@ -70,52 +70,20 @@ def test_image_data_url_maps_to_blob_part():
     ]
 
 
-def test_input_audio_maps_to_audio_blob_part():
+def test_input_audio_part_is_not_captured():
+    # Inline audio can be megabytes per part; it is deliberately left out of
+    # telemetry while the surrounding parts are still captured.
     parts = _user_parts(
         [
+            {"type": "text", "text": "transcribe this"},
             {
                 "type": "input_audio",
                 "input_audio": {"data": "UklGRg==", "format": "wav"},
-            }
+            },
         ]
     )
 
-    assert parts == [
-        BlobPart(mime_type="audio/wav", modality="audio", content=b"RIFF")
-    ]
-
-
-def test_input_audio_data_url_maps_to_audio_blob_part():
-    parts = _user_parts(
-        [
-            {
-                "type": "input_audio",
-                "input_audio": {
-                    "data": "data:audio/wav;base64,UklGRg==",
-                    "format": "wav",
-                },
-            }
-        ]
-    )
-
-    assert parts == [
-        BlobPart(mime_type="audio/wav", modality="audio", content=b"RIFF")
-    ]
-
-
-def test_unknown_audio_format_has_no_mime_type():
-    parts = _user_parts(
-        [
-            {
-                "type": "input_audio",
-                "input_audio": {"data": "UklGRg==", "format": "pcm16"},
-            }
-        ]
-    )
-
-    assert parts == [
-        BlobPart(mime_type=None, modality="audio", content=b"RIFF")
-    ]
+    assert parts == [TextPart(content="transcribe this")]
 
 
 def test_file_id_maps_to_file_part():
