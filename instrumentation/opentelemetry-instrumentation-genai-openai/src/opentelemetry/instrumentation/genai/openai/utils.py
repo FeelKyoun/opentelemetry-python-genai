@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.parse import urlparse
@@ -220,18 +221,36 @@ def _audio_to_part(input_audio: Any) -> MessagePart | None:
 def _document_to_part(file_obj: Any) -> MessagePart | None:
     """Build a part for a file descriptor: a reference when the file is
     hosted by OpenAI (``file_id``), a blob when it is uploaded inline
-    (``file_data``, a data: URL)."""
+    (``file_data``)."""
     if file_obj is None:
         return None
+    # The SDK carries no media type, but `filename` is what it sends for an
+    # inline upload, and an uploaded file keeps its name.
+    filename = get_property_value(file_obj, "filename")
+    mime_type = (
+        mimetypes.guess_type(filename)[0]
+        if isinstance(filename, str) and filename
+        else None
+    )
     file_id = get_property_value(file_obj, "file_id")
     if isinstance(file_id, str) and file_id:
-        return FilePart(mime_type=None, modality="document", file_id=file_id)
+        return FilePart(
+            mime_type=mime_type, modality="document", file_id=file_id
+        )
     file_data = get_property_value(file_obj, "file_data")
-    if isinstance(file_data, str) and file_data.startswith("data:"):
+    if not isinstance(file_data, str) or not file_data:
+        return None
+    if file_data.startswith("data:"):
         # Same data: URL shape as an inline image, so the mime type comes
-        # from the URL header.
+        # from the URL header rather than from the filename.
         return image_from_url(file_data, modality="document")
-    return None
+    # `file_data` is documented as plain base64.
+    content = decode_base64(file_data)
+    if content is None:
+        # Malformed payload: recording garbage bytes would be worse than
+        # dropping the part.
+        return None
+    return BlobPart(mime_type=mime_type, modality="document", content=content)
 
 
 def _content_to_parts(content: Any) -> list[MessagePart]:
