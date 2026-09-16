@@ -116,3 +116,15 @@ def test_refusal_part_is_recorded_as_text():
     )
 
     assert parts == [TextPart(content="I cannot help with that.")]
+
+
+def test_generator_content_is_left_for_the_sdk_to_consume():
+    # The SDK accepts any iterable for `content` and materializes it itself.
+    # This runs before the wrapped call, so consuming the generator here would
+    # leave the request with no content at all.
+    content = ({"type": "text", "text": "hello"} for _ in range(1))
+
+    parts = _content_to_parts(content)
+
+    assert parts == []
+    assert list(content) == [{"type": "text", "text": "hello"}]

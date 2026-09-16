@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
@@ -237,7 +237,13 @@ def _document_to_part(file_obj: Any) -> MessagePart | None:
 def _content_to_parts(content: Any) -> list[MessagePart]:
     if isinstance(content, str):
         return [TextPart(content=content)]
-    if not isinstance(content, Iterable) or isinstance(content, Mapping):
+    # Only a materialized sequence is walked. The SDK accepts any iterable
+    # for `content` and consumes it itself, so iterating a generator here -
+    # this runs before the wrapped call - would drain the caller's input and
+    # leave the request with no content at all.
+    if not isinstance(content, Sequence) or isinstance(
+        content, (bytes, bytearray)
+    ):
         return []
 
     parts: list[MessagePart] = []
